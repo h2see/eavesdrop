@@ -4,6 +4,11 @@ import secrets
 import json
 from pathlib import Path
 import spotipy
+import time
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
 def main():
@@ -15,74 +20,236 @@ def main():
         type=str,
         help="Stats.fm user ID whose stream you want to sync. If not provided, you will be prompted.",
     )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="Continuously sync playback until interrupted.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        help="Spotify device name or ID to use for playback. If not provided, the first available device will be used.",
+    )
     args = parser.parse_args()
 
     # Initialize Spotify client.
     try:
         sp = init_spotify()
     except Exception as e:
-        raise Exception(f"Error initializing Spotify client: {e}")
+        logging.error("Error initializing Spotify client: %s", e)
+        return
 
-    # Prompt for the Stats.fm user ID if not provided on the command line.
+    # Prompt for the Stats.fm user ID if not provided.
     statsfm_user = args.statsfm_user if args.statsfm_user else input("Please enter the Stats.fm user ID: ")
+    loop_mode = args.loop
 
-    # Fetch current stream data from Stats.fm.
+    last_spotify_id = None
+
     try:
-        sfm_user_stream = stats_fm_get_current_stream(statsfm_user)
-    except Exception as e:
-        raise Exception(f"Error fetching stream for user {statsfm_user}: {e}")
+        while True:
+            try:
+                sfm_user_stream = stats_fm_get_current_stream(statsfm_user)
+                logging.info("Fetched stream data: %s", sfm_user_stream)
+            except Exception as e:
+                logging.error("Error fetching stream for user %s: %s", statsfm_user, e)
+                if loop_mode:
+                    time.sleep(5)
+                    continue
+                else:
+                    return
 
-    item = sfm_user_stream.get("item")
-    if item is None:
-        raise Exception(f"StatsFM user {statsfm_user} is not currently playing anything!")
+            item = sfm_user_stream.get("item")
+            if item is None:
+                logging.warning("StatsFM user %s is not currently playing anything!", statsfm_user)
+                if loop_mode:
+                    time.sleep(5)
+                    continue
+                else:
+                    return
 
-    # Validate track details.
-    track = item.get("track")
-    if not track:
-        raise Exception("Track information is missing in the StatsFM response.")
+            # Validate track details.
+            track = item.get("track")
+            if not track:
+                logging.warning("Track information is missing in the StatsFM response.")
+                if loop_mode:
+                    time.sleep(5)
+                    continue
+                else:
+                    return
 
-    external_ids = track.get("externalIds")
-    if not external_ids:
-        raise Exception("External IDs are missing from the track data.")
+            duration = track.get("durationMs")
+            if not duration:
+                logging.warning("Duration is missing from track data.")
+                if loop_mode:
+                    time.sleep(5)
+                    continue
+                else:
+                    return
 
-    spotify_ids = external_ids.get("spotify")
-    if not spotify_ids or not isinstance(spotify_ids, list) or not spotify_ids:
-        raise Exception("No Spotify track ID found in the StatsFM response.")
-    spotify_id = spotify_ids[0]
+            external_ids = track.get("externalIds")
+            if not external_ids:
+                logging.warning("External IDs are missing from the track data.")
+                if loop_mode:
+                    time.sleep(5)
+                    continue
+                else:
+                    return
 
-    # Validate playback progress.
-    playback_offset = item.get("progressMs")
-    if playback_offset is None or not isinstance(playback_offset, int):
-        raise Exception("Invalid or missing playback progress from StatsFM.")
+            spotify_ids = external_ids.get("spotify")
+            if not spotify_ids or not isinstance(spotify_ids, list) or not spotify_ids:
+                logging.warning("No Spotify track ID found in the StatsFM response.")
+                if loop_mode:
+                    time.sleep(5)
+                    continue
+                else:
+                    return
 
-    # Get available Spotify devices.
-    devices_info = sp.devices()
-    if devices_info is None:
-        raise Exception("The devices spotipy method returned None.")
-    devices = devices_info.get("devices")
-    if not devices:
-        raise Exception("No active Spotify devices found. Please open Spotify on a device.")
+            current_spotify_id = spotify_ids[0]
+            playback_offset = item.get("progressMs")
+            if playback_offset is None or not isinstance(playback_offset, int):
+                logging.warning("Invalid or missing playback progress from StatsFM.")
+                if loop_mode:
+                    time.sleep(5)
+                    continue
+                else:
+                    return
 
-    device_id = devices[0].get("id")
-    if not device_id:
-        raise Exception("No valid device ID found in the Spotify devices list.")
+            # In loop mode, if the current Spotify track ID hasn't changed from the last iteration,
+            # poll the Stats.fm API every 0.75 seconds up to 5 times to check for an update.
+            if loop_mode and last_spotify_id is not None and current_spotify_id == last_spotify_id:
+                updated = False
+                for attempt in range(5):
+                    time.sleep(0.75)
+                    try:
+                        sfm_user_stream = stats_fm_get_current_stream(statsfm_user)
+                    except Exception as e:
+                        logging.error("Error fetching stream during update check: %s", e)
+                        break
+                    item_retry = sfm_user_stream.get("item")
+                    if item_retry is None:
+                        break
+                    track_retry = item_retry.get("track")
+                    if not track_retry:
+                        break
+                    external_ids_retry = track_retry.get("externalIds")
+                    if not external_ids_retry:
+                        break
+                    spotify_ids_retry = external_ids_retry.get("spotify")
+                    if not spotify_ids_retry or not isinstance(spotify_ids_retry, list) or not spotify_ids_retry:
+                        break
+                    new_spotify_id = spotify_ids_retry[0]
+                    if new_spotify_id != last_spotify_id:
+                        current_spotify_id = new_spotify_id
+                        playback_offset = item_retry.get("progressMs")
+                        duration = track_retry.get("durationMs")
+                        updated = True
+                        logging.info("StatsFM API updated to new track: %s", new_spotify_id)
+                        break
+                if not updated:
+                    logging.info("No update in StatsFM API after retries; restarting same track from beginning.")
+                    playback_offset = 0  # Restart the same song from beginning
 
-    # Check playback.
-    sp_current = sp.current_playback()
-    if sp_current is None:
-        raise Exception("The current_playback spotipy method returned None.")
-    sp_current_id = sp_current.get("item", {}).get("id")
-    if sp_current_id is None:
-        raise Exception("The spotipy user's current playback could not be determined.")
+            remaining_ms = duration - playback_offset
+            start = time.perf_counter()
+            end = start + (remaining_ms / 1000)
 
-    # Start playback on the selected device.
-    if sp_current_id != spotify_id:
-        try:
-            sp.start_playback(device_id=device_id, uris=[f"spotify:track:{spotify_id}"], position_ms=playback_offset)
-        except Exception as e:
-            raise Exception(f"Failed to start playback on Spotify: {e}")
-    else:
-        print("Did not update playback, already playing the same song.")
+            # Get available Spotify devices.
+            devices_info = sp.devices()
+            if devices_info is None:
+                logging.warning("The devices spotipy method returned None.")
+                if loop_mode:
+                    time.sleep(5)
+                    continue
+                else:
+                    return
+            devices = devices_info.get("devices")
+            if not devices:
+                logging.warning("No active Spotify devices found. Please open Spotify on a device.")
+                if loop_mode:
+                    time.sleep(5)
+                    continue
+                else:
+                    return
+
+            # Device selection: if --device is provided, try to match it by id or name.
+            device_id = None
+            if args.device:
+                for device in devices:
+                    if device.get("id") == args.device or device.get("name").lower() == args.device.lower():
+                        device_id = device.get("id")
+                        break
+                if device_id is None:
+                    logging.warning("No device matching '%s' found. Using the first available device.", args.device)
+                    device_id = devices[0].get("id")
+            else:
+                device_id = devices[0].get("id")
+
+            if not device_id:
+                logging.warning("No valid device ID found in the Spotify devices list.")
+                if loop_mode:
+                    time.sleep(5)
+                    continue
+                else:
+                    return
+
+            # Check current Spotify playback.
+            sp_current = sp.current_playback()
+            if sp_current is None:
+                logging.warning("The current_playback spotipy method returned None.")
+                if loop_mode:
+                    time.sleep(5)
+                    continue
+                else:
+                    return
+
+            sp_current_id = sp_current.get("item", {}).get("id")
+            if sp_current_id is None:
+                logging.warning("The spotipy user's current playback could not be determined.")
+                if loop_mode:
+                    time.sleep(5)
+                    continue
+                else:
+                    return
+
+            # Start playback on the selected device if needed.
+            if sp_current_id != current_spotify_id:
+                try:
+                    sp.start_playback(
+                        device_id=device_id,
+                        uris=[f"spotify:track:{current_spotify_id}"],
+                        position_ms=playback_offset,
+                    )
+                    logging.info(
+                        "Started playback of track %s at position %d ms.", current_spotify_id, playback_offset
+                    )
+                except Exception as e:
+                    logging.error("Failed to start playback on Spotify: %s", e)
+                    if loop_mode:
+                        time.sleep(5)
+                        continue
+                    else:
+                        return
+            else:
+                logging.info("Did not update playback, already playing the same song.")
+
+            # Wait until the track is expected to finish.
+            now = time.perf_counter()
+            while now < end:
+                time.sleep(0.1)
+                now = time.perf_counter()
+
+            logging.info("Track ended or sync interval complete.")
+            last_spotify_id = current_spotify_id
+
+            if not loop_mode:
+                break
+
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user, exiting gracefully.")
+
+
+if __name__ == "__main__":
+    main()
 
 
 def stats_fm_new_headers() -> dict:
@@ -119,7 +286,3 @@ def init_spotify(creds="creds.json") -> spotipy.Spotify:
             open_browser=False,
         )
     )
-
-
-if __name__ == "__main__":
-    main()
