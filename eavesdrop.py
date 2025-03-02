@@ -248,10 +248,6 @@ def main():
         logging.info("Interrupted by user, exiting gracefully.")
 
 
-if __name__ == "__main__":
-    main()
-
-
 def stats_fm_new_headers() -> dict:
     random_agent = secrets.token_urlsafe(16)
     return {"User-Agent": random_agent, "Accept": "application/json"}
@@ -286,3 +282,7 @@ def init_spotify(creds="creds.json") -> spotipy.Spotify:
             open_browser=False,
         )
     )
+
+
+if __name__ == "__main__":
+    main()
